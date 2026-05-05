@@ -25,9 +25,16 @@ from functools import lru_cache
 
 from application.services.ingestion_service import IngestionService
 from infrastructure.messaging.sqs_consumer import SQSConsumer
+from infrastructure.messaging.sqs_notification_publisher import (
+    SQSNotificationPublisher,
+)
 from infrastructure.messaging.sqs_publisher import SQSPublisher
 from infrastructure.parsers.openai_email_parser import OpenAIEmailParser
-from presentation.api.metrics import Metrics
+from presentation.api.metrics import (
+    Metrics,
+    notification_publish_total,
+    notification_throttled_total,
+)
 
 
 @lru_cache(maxsize=1)
@@ -38,8 +45,14 @@ def get_metrics() -> Metrics:
 
 @lru_cache(maxsize=1)
 def get_publisher() -> SQSPublisher:
-    """Retourne l'instance singleton de publisher SQS."""
+    """Retourne l'instance singleton de publisher SQS (FareEvent)."""
     return SQSPublisher()
+
+
+@lru_cache(maxsize=1)
+def get_notification_publisher() -> SQSNotificationPublisher:
+    """Retourne l'instance singleton de publisher SQS (notifications)."""
+    return SQSNotificationPublisher()
 
 
 @lru_cache(maxsize=1)
@@ -47,7 +60,14 @@ def get_ingestion_service() -> IngestionService:
     """Construit l'orchestrateur Application (`IngestionService`)."""
     parser = OpenAIEmailParser()
     publisher = get_publisher()
-    return IngestionService.build(parser=parser, publisher=publisher)
+    notif_publisher = get_notification_publisher()
+    return IngestionService.build(
+        parser=parser,
+        publisher=publisher,
+        notification_publisher=notif_publisher,
+        metrics_publish=notification_publish_total,
+        metrics_throttled=notification_throttled_total,
+    )
 
 
 @lru_cache(maxsize=1)

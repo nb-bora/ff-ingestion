@@ -60,6 +60,17 @@ publish_total = Counter(
     labelnames=("outcome",),
 )
 
+notification_publish_total = Counter(
+    "ingestion_notification_publish_total",
+    "Total number of NotificationEvent publications by category and outcome",
+    labelnames=("category", "outcome"),
+)
+notification_throttled_total = Counter(
+    "ingestion_notification_throttled_total",
+    "Total number of support_alert notifications throttled by failure_code",
+    labelnames=("failure_code",),
+)
+
 
 # ─────────────────────────────────────────────
 # Compat in-memory (legacy)

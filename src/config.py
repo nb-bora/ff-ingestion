@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     # ── SQS — Queues ─────────────────────────
     sqs_email_queue_url: str = Field(default="")
     sqs_fare_event_queue_url: str = Field(default="")
+    sqs_notifications_queue_url: str = Field(default="")
 
     # ── SQS — Paramètres ─────────────────────
     sqs_max_workers: int = Field(default=2)
@@ -89,6 +90,17 @@ class Settings(BaseSettings):
     consumer_enabled: bool = Field(default=True)
     consumer_max_retries: int = Field(default=3)
     consumer_error_delay_seconds: int = Field(default=5)
+
+    # ── Notifications ────────────────────────
+    # Kill switch global. Si False, aucun NotificationEvent n'est publié
+    # (utile pour les environnements de dev/test sans queue dédiée).
+    notifications_enabled: bool = Field(default=True)
+    # TTL anti-spam des support_alert (par failure_code).
+    support_alert_throttle_seconds: int = Field(default=300)
+    # Base URL des runbooks support (concaténée avec le failure_code).
+    support_runbook_base_url: Optional[str] = Field(default=None)
+    # Email de contact support proposé dans les templates user_untreatable.
+    support_contact_email: Optional[str] = Field(default=None)
 
     # ── X-Ray ────────────────────────────────
     enable_xray: bool = Field(default=False)

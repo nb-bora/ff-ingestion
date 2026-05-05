@@ -35,7 +35,12 @@ from botocore.config import Config
 from application.services.ingestion_service import IngestionService
 from config import settings
 from domain.entities.email_message import EmailMessage
+from domain.enums.failure_code import FailureCode
 from domain.value_objects.email_metadata import EmailThreadMetadata
+from infrastructure.error_collection.extractors import (
+    extract_error_info,
+    extract_source_artifact,
+)
 from logger import logger
 from presentation.api.metrics import (
     consumer_inflight,
@@ -290,6 +295,18 @@ class SQSConsumer:
                     message_id,
                 )
                 consumer_messages_total.labels(outcome="empty_body").inc()
+                await self._notify_support_alert(
+                    code=FailureCode.EMPTY_BODY,
+                    error_message="SQS message has no email_body",
+                    sqs_message=message,
+                    sender=sender,
+                    subject=subject,
+                    receive_count=receive_count,
+                    human_summary=(
+                        f"Message {message_id} reçu sans body email "
+                        f"exploitable; suppression de la queue."
+                    ),
+                )
                 should_delete = True
                 return
 
@@ -335,6 +352,18 @@ class SQSConsumer:
                     e,
                 )
                 consumer_messages_total.labels(outcome="missing_sender").inc()
+                await self._notify_support_alert(
+                    code=FailureCode.MISSING_SENDER,
+                    error=e,
+                    sqs_message=message,
+                    sender=None,
+                    subject=subject,
+                    receive_count=receive_count,
+                    human_summary=(
+                        "Message reçu sans expéditeur identifiable; "
+                        "aucune notification utilisateur possible."
+                    ),
+                )
                 should_delete = True
             except Exception as e:
                 if receive_count >= max_retries:
@@ -347,6 +376,30 @@ class SQSConsumer:
                         exc_info=True,
                     )
                     consumer_messages_total.labels(outcome="poison").inc()
+                    await self._notify_support_alert(
+                        code=FailureCode.POISON_MESSAGE,
+                        error=e,
+                        sqs_message=message,
+                        sender=sender,
+                        subject=subject,
+                        receive_count=receive_count,
+                        human_summary=(
+                            f"Poison message après {receive_count} "
+                            f"tentatives; bascule en DLQ."
+                        ),
+                    )
+                    if sender:
+                        await self._notify_user_untreatable(
+                            email=email,
+                            code=FailureCode.POISON_MESSAGE,
+                            sqs_source_message_id=message_id,
+                            receive_count=receive_count,
+                            human_summary=(
+                                "Nous n'avons pas réussi à traiter votre demande "
+                                "après plusieurs tentatives. Notre équipe a été "
+                                "alertée."
+                            ),
+                        )
                     should_delete = True
                 else:
                     logger.warning(
@@ -518,6 +571,82 @@ class SQSConsumer:
             "reply_to": reply_to,
             "mail": mail,
         }
+
+    # ─────────────────────────────────────────
+    # NOTIFICATIONS (hooks vers NotifyFailureUseCase)
+    # ─────────────────────────────────────────
+    async def _notify_support_alert(
+        self,
+        *,
+        code: FailureCode,
+        error: BaseException | None = None,
+        error_message: str | None = None,
+        sqs_message: dict | None = None,
+        sender: str | None = None,
+        subject: str | None = None,
+        receive_count: int | None = None,
+        human_summary: str | None = None,
+    ) -> None:
+        """Délègue à `NotifyFailureUseCase.support_alert` (best-effort)."""
+        try:
+            error_info = (
+                extract_error_info(error)
+                if error is not None
+                else extract_error_info(RuntimeError(error_message or code.value))
+            )
+            artifact = extract_source_artifact(
+                sqs_message,
+                queue_url=settings.sqs_email_queue_url or None,
+                fallback_sender=sender,
+                fallback_subject=subject,
+            )
+            await (
+                self._ingestion_service.notify_failure_use_case.support_alert(
+                    code=code,
+                    error=error_info,
+                    source_artifact=artifact,
+                    sender=sender,
+                    subject=subject,
+                    sqs_source_message_id=(
+                        sqs_message.get("MessageId") if sqs_message else None
+                    ),
+                    receive_count=receive_count,
+                    human_summary=human_summary,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "support_alert hook failed (non-fatal): code=%s err=%s",
+                code.value,
+                exc,
+            )
+
+    async def _notify_user_untreatable(
+        self,
+        *,
+        email: EmailMessage,
+        code: FailureCode,
+        sqs_source_message_id: str | None = None,
+        receive_count: int | None = None,
+        human_summary: str | None = None,
+    ) -> None:
+        """Délègue à `NotifyFailureUseCase.user_untreatable` (best-effort)."""
+        try:
+            await (
+                self._ingestion_service.notify_failure_use_case.user_untreatable(
+                    email=email,
+                    code=code,
+                    sqs_source_message_id=sqs_source_message_id,
+                    receive_count=receive_count,
+                    human_summary=human_summary,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "user_untreatable hook failed (non-fatal): code=%s err=%s",
+                code.value,
+                exc,
+            )
 
     # ─────────────────────────────────────────
     # DELETE (batcher)

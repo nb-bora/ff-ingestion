@@ -15,6 +15,13 @@ Pourquoi ici (et pas dans le consumer) ?
 - L'orchestration métier (parse → validate → publish) est une responsabilité
   Application, isolable et testable sans AWS.
 
+Notifications
+-------------
+- En cas de `ParseError` (parsing impossible côté OpenAI), on émet une
+  `user_untreatable` via `NotifyFailureUseCase` puis on **re-raise** :
+  - le caller (consumer) décide du delete/redelivery
+  - la notif est best-effort (`NotifyFailureUseCase` n'élève jamais)
+
 Utilisé par
 ---------
 - `infrastructure.messaging.SQSConsumer` (un appel par message reçu)
@@ -23,6 +30,7 @@ Erreurs
 -------
 - `MissingSenderError` levée si sender absent (utile au consumer pour
   prendre la décision de delete sans retry).
+- `ParseError` re-raised après publication d'une `user_untreatable`.
 - Toute autre exception (OpenAI, publish, etc.) remonte au consumer
   qui décide du retry/DLQ.
 """
@@ -34,11 +42,13 @@ import json
 from pydantic import ValidationError
 
 from application.interfaces.message_publisher import IMessagePublisher
+from application.use_cases.notify_failure_use_case import NotifyFailureUseCase
 from application.use_cases.parse_email_use_case import ParseEmailUseCase
 from domain.entities.email_message import EmailMessage
+from domain.enums.failure_code import FailureCode
 from logger import logger
 from presentation.schemas.fare_event_schema import FareEventSchema
-from shared.exceptions import MissingSenderError
+from shared.exceptions import MissingSenderError, ParseError
 
 
 class ProcessEmailUseCase:
@@ -49,9 +59,11 @@ class ProcessEmailUseCase:
         *,
         parse_email: ParseEmailUseCase,
         publisher: IMessagePublisher,
+        notify_failure: NotifyFailureUseCase,
     ):
         self._parse_email = parse_email
         self._publisher = publisher
+        self._notify_failure = notify_failure
 
     async def execute(self, email: EmailMessage) -> dict:
         """
@@ -61,6 +73,7 @@ class ProcessEmailUseCase:
         ------
         - Valide le sender (sinon `MissingSenderError` propagée)
         - Parse → `FareEvent` dict
+            - en cas de `ParseError` : émet une `user_untreatable` puis re-raise
         - Valide via `FareEventSchema` (log uniquement, pas bloquant)
         - Publie sur la queue downstream
         - Retourne le `FareEvent`
@@ -68,7 +81,19 @@ class ProcessEmailUseCase:
         if not email.sender:
             raise MissingSenderError("No sender email found in message")
 
-        fare_event = await self._parse_email.execute(email)
+        try:
+            fare_event = await self._parse_email.execute(email)
+        except ParseError:
+            await self._notify_failure.user_untreatable(
+                email=email,
+                code=FailureCode.PARSE_FAILED,
+                human_summary=(
+                    "Nous n'avons pas réussi à interpréter votre demande "
+                    "automatiquement."
+                ),
+            )
+            raise
+
         _validate_non_blocking(fare_event)
         await self._publisher.publish_fare_event(fare_event)
         return fare_event

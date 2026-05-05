@@ -21,6 +21,7 @@ def test_safe_int_handles_bad_values():
 class _FakeIngestionService:
     parse_email_use_case = None
     process_email_use_case = None
+    notify_failure_use_case = None
 
 
 @pytest.fixture
