@@ -7,6 +7,25 @@ from datetime import UTC, datetime
 from domain.enums.parsing_status import ParsingStatus
 from domain.value_objects.email_metadata import EmailThreadMetadata
 
+# Namespace UUID pour l'idempotence des `FareEvent` (déterminisme via uuid5).
+# Constant à travers les déploiements: ne pas modifier sans coordination.
+_FARE_EVENT_NAMESPACE = uuid.UUID("8a4f2c4a-2d2e-4f8b-9c6c-2c8a3b6e7f5a")
+
+
+def _build_fare_event_id(
+    *, sender: str, thread_message_id: str | None
+) -> str:
+    """
+    Calcule un `id` déterministe (uuid5) pour idempotence downstream.
+
+    - Si on dispose d'un `Message-ID` email (RFC822), on s'en sert.
+    - Sinon, fallback sur un uuid4 (non déterministe).
+    """
+    if thread_message_id:
+        seed = f"{sender}|{thread_message_id}"
+        return str(uuid.uuid5(_FARE_EVENT_NAMESPACE, seed))
+    return str(uuid.uuid4())
+
 
 @dataclass
 class FareEvent:
@@ -70,8 +89,11 @@ class FareEvent:
         normalized_status = (
             status.value if isinstance(status, ParsingStatus) else str(status)
         )
+        thread_message_id = thread.message_id if thread else None
         return FareEvent(
-            id=str(uuid.uuid4()),
+            id=_build_fare_event_id(
+                sender=sender, thread_message_id=thread_message_id
+            ),
             sender=sender,
             parsed_at=datetime.now(UTC).isoformat(),
             email_body_length=email_body_length,

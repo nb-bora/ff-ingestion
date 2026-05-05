@@ -17,12 +17,23 @@ Utilisé par
 Utilise
 -------
 - `shared.email_utils.extract_email_body` (nettoyage corps email)
-- `xray_config.subsegment` (trace sur l’appel OpenAI)
-- `config.settings` (`openai_api_key`, `openai_model`)
+- `xray_config.subsegment` (trace sur l'appel OpenAI)
+- `config.settings` (`get_openai_api_key`, `openai_model`, timeouts, ...)
 
-Impact / effets de bord
-----------------------
-- Appels réseau vers OpenAI (latence/coût).
+Robustesse
+----------
+- Client OpenAI configuré avec `timeout` et `max_retries` (settings).
+- `temperature=0` pour une extraction déterministe.
+- `response_format={"type": "json_object"}` pour garantir la forme JSON
+  (sur les modèles compatibles, cf. `_supports_json_response_format`).
+- Fallback `max_completion_tokens` pour les modèles type `gpt-5*` / `o1*`
+  basé sur le nom du modèle (pas de string match fragile sur l'erreur).
+
+Logs
+----
+- Par défaut, on log uniquement les métadonnées de la réponse (id, model,
+  finish_reason, length). Le contenu intégral n'est loggé que si
+  `LOG_OPENAI_PAYLOAD=true` (DEV uniquement).
 """
 
 from __future__ import annotations
@@ -31,7 +42,7 @@ import asyncio
 import json
 from datetime import date, timedelta
 
-from openai import BadRequestError, OpenAI
+from openai import OpenAI
 
 from application.interfaces.email_parser import IEmailParser
 from config import settings
@@ -90,13 +101,7 @@ User: "cheapest flight to Barcelona sometime in August"
 
 
 def _next_monday(from_date: date) -> date:
-    """
-    Calcule le prochain lundi (strictement après `from_date`).
-
-    Utilisé par
-    ---------
-    - `_build_system_prompt` (exemples du prompt)
-    """
+    """Calcule le prochain lundi (strictement après `from_date`)."""
     days_ahead = (0 - from_date.weekday() + 7) % 7
     if days_ahead == 0:
         days_ahead = 7
@@ -104,19 +109,40 @@ def _next_monday(from_date: date) -> date:
 
 
 def _build_system_prompt() -> str:
-    """
-    Rend le prompt système avec placeholders dynamiques (date courante).
-
-    Utilisé par
-    ---------
-    - `OpenAIEmailParser._parse_with_openai`
-    """
+    """Rend le prompt système avec placeholders dynamiques (date courante)."""
     today_dt = date.today()
     return SYSTEM_PROMPT_TEMPLATE.format(
         today=today_dt.strftime("%Y-%m-%d"),
         next_monday=_next_monday(today_dt).strftime("%Y-%m-%d"),
         year=str(today_dt.year),
     )
+
+
+def _uses_max_completion_tokens(model: str) -> bool:
+    """
+    Détermine si le modèle attend `max_completion_tokens` au lieu de `max_tokens`.
+
+    Règle simple basée sur le nom du modèle (pas un string match fragile sur
+    le message d'erreur OpenAI).
+    """
+    m = (model or "").lower()
+    return m.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _supports_json_response_format(model: str) -> bool:
+    """
+    Détermine si `response_format={"type": "json_object"}` est supporté.
+
+    Disponible depuis `gpt-4-turbo`, `gpt-4o*`, `gpt-3.5-turbo` (>=1106),
+    `gpt-5*`, `o1*`, etc. On filtre conservativement les modèles legacy.
+    """
+    m = (model or "").lower()
+    if not m:
+        return False
+    legacy_prefixes = ("text-davinci", "code-davinci", "gpt-3", "babbage", "curie")
+    if any(m.startswith(p) for p in legacy_prefixes):
+        return False
+    return True
 
 
 class OpenAIEmailParser(IEmailParser):
@@ -131,52 +157,39 @@ class OpenAIEmailParser(IEmailParser):
     """
 
     def __init__(self):
-        """
-        Initialise le parser et tente de créer le client OpenAI.
-
-        Impact
-        ------
-        - Peut logger un warning si `OPENAI_API_KEY` absent.
-        """
+        """Initialise le parser et tente de créer le client OpenAI."""
         self._client = self._initialize_openai_client()
 
     def _initialize_openai_client(self) -> OpenAI | None:
         """
-        Initialise `openai.OpenAI` si possible.
-
-        Utilisé par
-        ---------
-        - `__init__`
+        Initialise `openai.OpenAI` si possible, avec timeout et retries.
 
         Erreurs
         ------
-        - Ne lève pas: retourne `None` et log en cas d’échec.
+        - Ne lève pas: retourne `None` et log en cas d'échec.
         """
-        if not settings.openai_api_key:
+        api_key = settings.get_openai_api_key()
+        if not api_key:
             logger.warning("OpenAI API key non configurée")
             return None
         try:
-            return OpenAI(api_key=settings.openai_api_key)
+            return OpenAI(
+                api_key=api_key,
+                timeout=settings.openai_timeout_seconds,
+                max_retries=settings.openai_max_retries,
+            )
         except Exception as e:
             logger.error("Failed to initialize OpenAI client: %s", e)
             return None
 
     def _parse_with_openai(self, email: EmailMessage) -> tuple[dict, str | None]:
         """
-        Exécute l’appel OpenAI d’extraction (synchrone).
-
-        Utilisé par
-        ---------
-        - `parse` via `run_in_executor`
-
-        Utilise
-        -------
-        - `extract_email_body` (nettoyer le body)
-        - `SYSTEM_PROMPT_TEMPLATE` (schema JSON)
+        Exécute l'appel OpenAI d'extraction (synchrone).
 
         Erreurs
         ------
         - `RuntimeError` si OpenAI non configuré.
+        - Toute exception réseau/auth/quota OpenAI remonte au caller.
         """
         if self._client is None:
             raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -184,7 +197,7 @@ class OpenAIEmailParser(IEmailParser):
         body_text = (extract_email_body(email.body_text) or "")[:5000]
         subject = email.subject or ""
 
-        resp = _create_chat_completion_with_fallback(
+        resp = _create_chat_completion(
             client=self._client,
             model=settings.openai_model,
             max_tokens=512,
@@ -195,28 +208,22 @@ class OpenAIEmailParser(IEmailParser):
         )
 
         response_text = resp.choices[0].message.content if resp.choices else ""
-        logger.info(
-            "OpenAI full response: id=%s model=%s finish_reason=%s content=%s",
-            resp.id,
-            resp.model,
-            resp.choices[0].finish_reason if resp.choices else None,
-            response_text,
-        )
+        _log_openai_response("parse", resp, response_text)
         try:
             parsed = json.loads(response_text)
         except json.JSONDecodeError:
-            logger.warning("OpenAI response is not valid JSON: %s", response_text)
+            logger.warning(
+                "OpenAI response is not valid JSON: id=%s len=%d",
+                resp.id,
+                len(response_text or ""),
+            )
             parsed = {}
         return parsed, resp.id
 
     def _failure_reasons(self, email: EmailMessage) -> tuple[list[str], str | None]:
         """
         Demande à OpenAI des raisons "humaines" expliquant pourquoi la demande
-        n’est pas parsable (extraction incomplète).
-
-        Utilisé par
-        ---------
-        - `parse` quand `origin/destination` manquent ou quand JSON invalide.
+        n'est pas parsable (extraction incomplète).
         """
         if self._client is None:
             return ["We couldn't process your email at the moment"], None
@@ -226,7 +233,7 @@ Provide 2-3 concise reasons in conversational language.
 
 Input may be English or French. Respond in the same language as the user's message.
 If language is unclear, respond in English.
-IMPORTANT: Return ONLY a valid JSON object. No explanation, no markdown, no code fences.
+IMPORTANT: Return ONLY a valid JSON object with key "reasons" (list of strings).
 
 Examples:
 - "We couldn't find where you want to fly from"
@@ -235,12 +242,12 @@ Examples:
 - "Nous n'avons pas trouve votre aeroport de depart"
 - "Pouvez-vous preciser votre destination?"
 
-Return as JSON: ["reason 1", "reason 2"]"""
+Return as JSON: {"reasons": ["reason 1", "reason 2"]}"""
 
         body_text = (extract_email_body(email.body_text) or "")[:3000]
         subject = email.subject or ""
 
-        resp = _create_chat_completion_with_fallback(
+        resp = _create_chat_completion(
             client=self._client,
             model=settings.openai_model,
             max_tokens=256,
@@ -254,19 +261,18 @@ Return as JSON: ["reason 1", "reason 2"]"""
         )
 
         response_text = resp.choices[0].message.content if resp.choices else ""
-        logger.info(
-            "OpenAI full failure-reasons response: id=%s model=%s finish_reason=%s content=%s",
-            resp.id,
-            resp.model,
-            resp.choices[0].finish_reason if resp.choices else None,
-            response_text,
-        )
+        _log_openai_response("failure_reasons", resp, response_text)
         try:
-            reasons = json.loads(response_text)
+            payload = json.loads(response_text)
+            reasons = payload.get("reasons") if isinstance(payload, dict) else payload
             if isinstance(reasons, list):
                 return [str(r) for r in reasons], resp.id
         except json.JSONDecodeError:
-            logger.warning("Failed to parse OpenAI reasons as JSON: %s", response_text)
+            logger.warning(
+                "Failed to parse OpenAI reasons as JSON: id=%s len=%d",
+                resp.id,
+                len(response_text or ""),
+            )
         return ["We need more details to process your request"], resp.id
 
     async def parse(
@@ -274,10 +280,6 @@ Return as JSON: ["reason 1", "reason 2"]"""
     ) -> tuple[dict, str | None, list[str] | None]:
         """
         Parse async (contrat Application).
-
-        Utilisé par
-        ---------
-        - `application.use_cases.ParseEmailUseCase.execute`
 
         Impact
         ------
@@ -287,13 +289,12 @@ Return as JSON: ["reason 1", "reason 2"]"""
             logger.warning("OpenAI non configuré")
             return {}, None, ["OpenAI API not configured"]
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         with subsegment("parse_with_openai"):
             extracted, response_id = await loop.run_in_executor(
                 None, self._parse_with_openai, email
             )
 
-        # failure reasons si extraction invalide (align ff-ingestion)
         if not extracted or ("error" in extracted):
             reasons, _ = await loop.run_in_executor(None, self._failure_reasons, email)
             return extracted or {}, response_id, reasons
@@ -307,7 +308,7 @@ Return as JSON: ["reason 1", "reason 2"]"""
         return extracted, response_id, None
 
 
-def _create_chat_completion_with_fallback(
+def _create_chat_completion(
     *,
     client: OpenAI,
     model: str,
@@ -315,28 +316,46 @@ def _create_chat_completion_with_fallback(
     max_tokens: int,
 ):
     """
-    Compatibilité modèles OpenAI.
-
-    Certains modèles (ex: `gpt-5-*`) refusent `max_tokens` et demandent
-    `max_completion_tokens`. Pour éviter de casser l’exécution selon le modèle,
-    on tente d’abord `max_tokens`, puis on réessaie en fallback.
-
-    Impact
-    ------
-    - Peut effectuer 2 requêtes OpenAI dans le pire cas (si fallback).
+    Wrapper d'appel OpenAI qui:
+    - sélectionne `max_tokens` ou `max_completion_tokens` selon le modèle
+    - force `temperature=0` (extraction déterministe)
+    - active `response_format={"type": "json_object"}` quand supporté
     """
-    try:
-        return client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=messages,
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+    }
+    if _uses_max_completion_tokens(model):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
+    if _supports_json_response_format(model):
+        kwargs["response_format"] = {"type": "json_object"}
+
+    return client.chat.completions.create(**kwargs)
+
+
+def _log_openai_response(kind: str, resp, response_text: str | None) -> None:
+    """
+    Log la réponse OpenAI sans contenu en prod (PII potentielles).
+    Le contenu intégral n'est loggé que si `LOG_OPENAI_PAYLOAD=true`.
+    """
+    finish = resp.choices[0].finish_reason if resp.choices else None
+    base = (
+        "OpenAI %s response: id=%s model=%s finish_reason=%s len=%d",
+        kind,
+        getattr(resp, "id", None),
+        getattr(resp, "model", None),
+        finish,
+        len(response_text or ""),
+    )
+    logger.info(*base)
+
+    if settings.log_openai_payload:
+        logger.debug(
+            "OpenAI %s full payload: id=%s content=%s",
+            kind,
+            getattr(resp, "id", None),
+            response_text,
         )
-    except BadRequestError as e:
-        msg = str(e)
-        if "Unsupported parameter" in msg and "max_tokens" in msg:
-            return client.chat.completions.create(
-                model=model,
-                max_completion_tokens=max_tokens,
-                messages=messages,
-            )
-        raise

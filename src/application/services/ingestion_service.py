@@ -1,10 +1,10 @@
 """
-Facade d’assemblage de la couche Application.
+Facade d'assemblage de la couche Application.
 
 Rôle
 ----
-- Construire des use-cases prêts à l’emploi à partir d’implémentations
-  concrètes (parser/publisher).
+- Construire des use-cases prêts à l'emploi à partir d'implémentations
+  concrètes (parser + publisher).
 
 Utilisé par
 ---------
@@ -12,7 +12,7 @@ Utilisé par
 
 Pourquoi une facade ?
 --------------------
-Pour que Presentation/Infrastructure n’ait pas à connaître les détails des
+Pour que Presentation/Infrastructure n'ait pas à connaître les détails des
 constructeurs de use-cases et leurs dépendances internes.
 """
 
@@ -21,31 +21,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from application.interfaces.email_parser import IEmailParser
+from application.interfaces.message_publisher import IMessagePublisher
 from application.use_cases.parse_email_use_case import ParseEmailUseCase
 from application.use_cases.process_email_use_case import ProcessEmailUseCase
 
 
 @dataclass(frozen=True)
 class IngestionService:
-    """
-    Facade d’orchestration (Application) : construit les use-cases.
-    """
+    """Facade d'orchestration (Application) : construit les use-cases."""
 
     parse_email_use_case: ParseEmailUseCase
     process_email_use_case: ProcessEmailUseCase
 
     @staticmethod
-    def build(*, parser: IEmailParser) -> IngestionService:
-        """
-        Factory de composition.
-
-        Utilise
-        -------
-        - `ParseEmailUseCase(parser=...)`
-        - `ProcessEmailUseCase(parse_email=...)`
-        """
+    def build(
+        *,
+        parser: IEmailParser,
+        publisher: IMessagePublisher,
+    ) -> "IngestionService":
+        """Factory de composition."""
         parse_uc = ParseEmailUseCase(parser=parser)
-        process_uc = ProcessEmailUseCase(parse_email=parse_uc)
+        process_uc = ProcessEmailUseCase(
+            parse_email=parse_uc, publisher=publisher
+        )
         return IngestionService(
             parse_email_use_case=parse_uc,
             process_email_use_case=process_uc,

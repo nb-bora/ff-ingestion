@@ -3,8 +3,8 @@ Configuration applicative (Settings) du microservice.
 
 Rôle
 ----
-- Centraliser toutes les variables d’environnement (service, AWS, SQS, OpenAI, X-Ray).
-- Résoudre la clé OpenAI depuis:
+- Centraliser toutes les variables d'environnement (service, AWS, SQS, OpenAI, X-Ray).
+- Résoudre la clé OpenAI **à la première utilisation** depuis:
   - `OPENAI_API_KEY` (env)
   - ou AWS Secrets Manager (si `SECRETS_MANAGER_ENABLED=true`)
 
@@ -16,83 +16,28 @@ Utilisé par
 
 Impact / effets de bord
 ----------------------
-- Lors de l’instanciation de `Settings`, peut appeler AWS Secrets Manager
-  (si activé) et donc nécessiter des credentials AWS.
+- L'instanciation de `Settings` ne fait **aucun appel réseau**.
+- L'appel à `settings.get_openai_api_key()` peut faire un appel à AWS
+  Secrets Manager (timeout 5s, max_attempts 3). Le résultat est mémoïsé.
 """
 
-import json
-from pathlib import Path
-from typing import Any, Optional
+from __future__ import annotations
 
-import boto3
-from botocore.exceptions import ClientError
-from pydantic import Field, model_validator
+from pathlib import Path
+from threading import Lock
+from typing import Optional
+
+from pydantic import Field, PrivateAttr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# ─────────────────────────────────────────────
-# AWS SECRETS MANAGER
-# ─────────────────────────────────────────────
-def get_secret(
-    secret_name: str,
-    region_name: str,
-    profile_name: Optional[str] = None,
-) -> str:
-    """
-    Récupère un secret depuis AWS Secrets Manager.
-
-    Utilisé par
-    ---------
-    - `Settings.resolve_openai_api_key` quand `secrets_manager_enabled=true`
-
-    Impact
-    ------
-    - Appel réseau AWS (Secrets Manager).
-    - Lève `RuntimeError` avec un message explicite si le secret est absent ou
-      si l’accès est refusé.
-    """
-    try:
-        session = (
-            boto3.Session(profile_name=profile_name)
-            if profile_name
-            else boto3.Session()
-        )
-        client = session.client("secretsmanager", region_name=region_name)
-        response = client.get_secret_value(SecretId=secret_name)
-
-        if "SecretString" in response:
-            return response["SecretString"]
-
-        return response["SecretBinary"].decode("utf-8")
-
-    except ClientError as e:
-        error_code = e.response["Error"]["Code"]
-        messages: dict[str, str] = {
-            "ResourceNotFoundException": f"Secret '{secret_name}' introuvable dans la région '{region_name}'",
-            "AccessDeniedException": f"Accès refusé au secret '{secret_name}'",
-        }
-        raise RuntimeError(
-            messages.get(error_code, f"Erreur Secrets Manager : {e}")
-        ) from e
-
-
-# ─────────────────────────────────────────────
-# SETTINGS
-# ─────────────────────────────────────────────
 class Settings(BaseSettings):
     """
     Paramètres applicatifs chargés depuis les variables d'environnement.
 
-    Utilisé par
-    ---------
-    - `main.py` (lifespan, flags consumer, env)
-    - `infrastructure.messaging` (SQS URLs, région, profil)
-    - `infrastructure.parsers` (OpenAI model/key)
-    - `infrastructure.aws.xray_config` (enable_xray, daemon address)
-
     Note
     ----
-    La `model_config` charge `.env` depuis la racine du repo.
+    `model_config` charge `.env` depuis la racine du repo.
     """
 
     model_config = SettingsConfigDict(
@@ -111,7 +56,7 @@ class Settings(BaseSettings):
     port: int = Field(default=8000)
 
     # ── AWS ──────────────────────────────────
-    aws_region: str = Field(default="af-south-1")
+    aws_region: str = Field(default="us-east-1")
     aws_profile: Optional[str] = Field(default=None)
 
     # ── SQS — Queues ─────────────────────────
@@ -125,12 +70,18 @@ class Settings(BaseSettings):
     sqs_visibility_timeout: int = Field(default=300)
     sqs_max_concurrent_messages: int = Field(default=10)
 
+    # ── SQS — Heartbeat (extension du visibility timeout pendant le parse) ──
+    sqs_heartbeat_interval_seconds: int = Field(default=60)
+    sqs_heartbeat_extend_seconds: int = Field(default=120)
+
     # ── SQS — FIFO ───────────────────────────
     parsed_sqs_message_group_id: str = Field(default="default")
 
     # ── OpenAI ───────────────────────────────
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-4o-mini")
+    openai_timeout_seconds: float = Field(default=20.0)
+    openai_max_retries: int = Field(default=2)
     secrets_manager_enabled: bool = Field(default=False)
     openai_secret_name: str = Field(default="fairfare/openai-api-key")
 
@@ -143,48 +94,62 @@ class Settings(BaseSettings):
     enable_xray: bool = Field(default=False)
     aws_xray_daemon_address: str = Field(default="127.0.0.1:2000")
 
+    # ── Logs ─────────────────────────────────
+    # Log le contenu intégral des réponses OpenAI (DEV uniquement).
+    log_openai_payload: bool = Field(default=False)
+
     # ─────────────────────────────────────────
-    # VALIDATORS
+    # RÉSOLUTION LAZY DE LA CLÉ OPENAI
     # ─────────────────────────────────────────
-    @model_validator(mode="after")
-    def resolve_openai_api_key(self) -> "Settings":
+    # Cache et verrou: l'appel à Secrets Manager se fait au plus une fois.
+    _openai_key_cache: Optional[str] = PrivateAttr(default=None)
+    _openai_key_lock: Lock = PrivateAttr(default_factory=Lock)
+
+    def get_openai_api_key(self) -> str:
         """
-        Résout `openai_api_key` (env > Secrets Manager).
+        Retourne la clé OpenAI, résolue paresseusement.
 
-        Parité `ff-ingestion`
-        ---------------------
-        Le service doit pouvoir démarrer même sans OpenAI en dev; dans ce cas
-        `openai_api_key` reste vide et `/health` expose `openai_configured=false`.
+        Ordre de résolution
+        -------------------
+        1. `OPENAI_API_KEY` (env / `.env`)
+        2. AWS Secrets Manager si `SECRETS_MANAGER_ENABLED=true`
+        3. Chaîne vide → mode dégradé (OpenAI absent)
 
-        Utilise
-        -------
-        - `get_secret` si `secrets_manager_enabled=true`
+        Note
+        ----
+        - La résolution est mémoïsée: un seul appel réseau par process.
+        - Aucune exception levée: en cas d'échec Secrets Manager, on
+          retourne "" et un warning est loggé. Le caller (parser) décide.
         """
         if self.openai_api_key:
-            return self
+            return self.openai_api_key
 
-        # Aligné sur ff-ingestion: l’app peut démarrer sans OpenAI (mode dégradé).
-        if not self.secrets_manager_enabled:
-            return self
+        if self._openai_key_cache is not None:
+            return self._openai_key_cache
 
-        secret_value = get_secret(
-            self.openai_secret_name,
-            self.aws_region,
-            self.aws_profile,
-        )
+        with self._openai_key_lock:
+            if self._openai_key_cache is not None:
+                return self._openai_key_cache
 
-        try:
-            secret_dict: dict[str, Any] = json.loads(secret_value)
-            self.openai_api_key = (
-                secret_dict.get("api_key")
-                or secret_dict.get("OPENAI_API_KEY")
-                or secret_dict.get("key")
-                or secret_value
-            )
-        except (json.JSONDecodeError, TypeError):
-            self.openai_api_key = secret_value
+            resolved = ""
+            if self.secrets_manager_enabled:
+                # Import différé pour éviter d'importer boto3 si secrets_manager
+                # est désactivé (et pour casser les cycles d'import potentiels).
+                from infrastructure.aws.secrets_manager import (
+                    extract_secret_key,
+                    get_secret,
+                )
 
-        return self
+                secret_value = get_secret(
+                    secret_name=self.openai_secret_name,
+                    region_name=self.aws_region,
+                    profile_name=self.aws_profile,
+                )
+                if secret_value:
+                    resolved = extract_secret_key(secret_value)
+
+            self._openai_key_cache = resolved
+            return resolved
 
 
 # ─────────────────────────────────────────────

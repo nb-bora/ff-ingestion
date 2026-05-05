@@ -30,7 +30,8 @@ install:
 # DÉVELOPPEMENT
 # ─────────────────────────────────────────────
 dev:
-	ENVIRONMENT=dev uvicorn src.main:app \
+	ENVIRONMENT=dev python -m uvicorn main:app \
+		--app-dir src \
 		--host 0.0.0.0 \
 		--port 8000 \
 		--reload
@@ -68,7 +69,10 @@ build:
 # PRODUCTION
 # ─────────────────────────────────────────────
 run:
-	ENVIRONMENT=prod python src/main.py
+	ENVIRONMENT=prod python -m uvicorn main:app \
+		--app-dir src \
+		--host 0.0.0.0 \
+		--port 8000
 
 # ─────────────────────────────────────────────
 # NETTOYAGE

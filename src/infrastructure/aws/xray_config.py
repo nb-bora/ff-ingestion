@@ -88,10 +88,26 @@ def end_segment() -> None:
 
 
 def current_trace_header() -> str | None:
+    """
+    Construit un trace header AWS X-Ray complet pour propagation downstream.
+
+    Format
+    ------
+    `Root={trace_id};Parent={segment_id};Sampled=1`
+
+    Le `Parent` est nécessaire pour qu'AWS reconstruise correctement la chaîne
+    parent → enfant entre services.
+    """
     if not getattr(settings, "enable_xray", False) or _xray_recorder is None:
         return None
 
     seg = _xray_recorder.current_segment()
-    if seg is not None:
-        return f"Root={seg.trace_id};Sampled=1"
-    return None
+    if seg is None:
+        return None
+
+    parts = [f"Root={seg.trace_id}"]
+    seg_id = getattr(seg, "id", None)
+    if seg_id:
+        parts.append(f"Parent={seg_id}")
+    parts.append("Sampled=1")
+    return ";".join(parts)
