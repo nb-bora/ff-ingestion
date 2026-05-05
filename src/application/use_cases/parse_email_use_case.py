@@ -93,9 +93,17 @@ class ParseEmailUseCase:
 
 def _is_valid_extraction(extracted_travel: dict | None) -> bool:
     """
-    Aligné sur ff-ingestion: on exige au minimum origin + destination.
-    (Le prompt inclut departure_date comme "required", mais le code de référence
-    vérifie origin/destination en pratique.)
+    Extraction "valide" pour publication downstream.
+
+    Règle (Tier 1 minimal côté Ingestion)
+    ------------------------------------
+    On exige au minimum :
+    - origin
+    - destination
+    - departure_date
+
+    Sinon, le `FareEvent.status` est `parsing_failed` et le message doit être
+    routé vers la queue notifications (workflow contractuel).
 
     Utilisé par
     ---------
@@ -109,6 +117,8 @@ def _is_valid_extraction(extracted_travel: dict | None) -> bool:
         return False
     origin = extracted_travel.get("origin")
     destination = extracted_travel.get("destination")
+    departure_date = extracted_travel.get("departure_date")
     has_origin = origin is not None and str(origin).strip() != ""
     has_destination = destination is not None and str(destination).strip() != ""
-    return has_origin and has_destination
+    has_departure_date = departure_date is not None and str(departure_date).strip() != ""
+    return has_origin and has_destination and has_departure_date

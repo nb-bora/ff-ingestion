@@ -28,7 +28,13 @@ async def test_parse_email_missing_sender_raises():
 
 @pytest.mark.asyncio
 async def test_parse_email_valid_extraction_returns_parsed_status():
-    parser = _FakeParser(extracted={"origin": "CDG", "destination": "JFK"})
+    parser = _FakeParser(
+        extracted={
+            "origin": "CDG",
+            "destination": "JFK",
+            "departure_date": "2026-06-17",
+        }
+    )
     uc = ParseEmailUseCase(parser=parser)
     email = EmailMessage(
         sender="a@b.com",
@@ -39,7 +45,11 @@ async def test_parse_email_valid_extraction_returns_parsed_status():
     fare = await uc.execute(email)
     assert fare["status"] == "parsed"
     assert fare["sender"] == "a@b.com"
-    assert fare["extracted_travel"] == {"origin": "CDG", "destination": "JFK"}
+    assert fare["extracted_travel"] == {
+        "origin": "CDG",
+        "destination": "JFK",
+        "departure_date": "2026-06-17",
+    }
     assert fare["openai_response_id"] == "resp-1"
 
 

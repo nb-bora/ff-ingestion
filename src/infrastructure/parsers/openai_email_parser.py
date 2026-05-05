@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 from openai import OpenAI
@@ -129,6 +130,19 @@ def _uses_max_completion_tokens(model: str) -> bool:
     return m.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
+def _uses_responses_api(model: str) -> bool:
+    """
+    Détermine si on doit utiliser l'API OpenAI Responses.
+
+    Motivation
+    ----------
+    Certains modèles récents (ex: `gpt-5*`) ont des différences de support
+    (paramètres, format de sortie) qui rendent `responses.create` plus fiable
+    que `chat.completions.create` dans notre workflow d'extraction JSON.
+    """
+    return _uses_max_completion_tokens(model)
+
+
 def _supports_json_response_format(model: str) -> bool:
     """
     Détermine si `response_format={"type": "json_object"}` est supporté.
@@ -143,6 +157,31 @@ def _supports_json_response_format(model: str) -> bool:
     if any(m.startswith(p) for p in legacy_prefixes):
         return False
     return True
+
+
+def _supports_temperature_control(model: str) -> bool:
+    """
+    Détermine si on peut contrôler `temperature`.
+
+    Contexte
+    --------
+    Sur certains modèles (ex: `gpt-5-mini`), OpenAI renvoie 400 si `temperature`
+    est fourni avec une valeur autre que la valeur par défaut. Dans ces cas,
+    on omet complètement le paramètre.
+    """
+    m = (model or "").lower()
+    if not m:
+        return False
+    fixed_temperature_prefixes = ("gpt-5", "o1", "o3", "o4")
+    return not m.startswith(fixed_temperature_prefixes)
+
+
+@dataclass(frozen=True)
+class _OpenAITextResult:
+    response_id: str | None
+    model: str | None
+    finish_reason: str | None
+    text: str
 
 
 class OpenAIEmailParser(IEmailParser):
@@ -197,28 +236,41 @@ class OpenAIEmailParser(IEmailParser):
         body_text = (extract_email_body(email.body_text) or "")[:5000]
         subject = email.subject or ""
 
-        resp = _create_chat_completion(
+        system_prompt = _build_system_prompt()
+        user_content = f"Subject: {subject}\n\n{body_text}"
+
+        result = _create_openai_text(
             client=self._client,
             model=settings.openai_model,
             max_tokens=512,
-            messages=[
-                {"role": "system", "content": _build_system_prompt()},
-                {"role": "user", "content": f"Subject: {subject}\n\n{body_text}"},
-            ],
+            system_prompt=system_prompt,
+            user_content=user_content,
         )
 
-        response_text = resp.choices[0].message.content if resp.choices else ""
-        _log_openai_response("parse", resp, response_text)
+        response_text = result.text
+        _log_openai_response(
+            kind="parse",
+            response_id=result.response_id,
+            model=result.model,
+            finish_reason=result.finish_reason,
+            response_text=response_text,
+        )
         try:
             parsed = json.loads(response_text)
+            if settings.log_openai_payload:
+                logger.info(
+                    "OpenAI parsed extraction: id=%s extracted=%s",
+                    result.response_id,
+                    json.dumps(parsed, ensure_ascii=False)[:2000],
+                )
         except json.JSONDecodeError:
             logger.warning(
                 "OpenAI response is not valid JSON: id=%s len=%d",
-                resp.id,
+                result.response_id,
                 len(response_text or ""),
             )
             parsed = {}
-        return parsed, resp.id
+        return parsed, result.response_id
 
     def _failure_reasons(self, email: EmailMessage) -> tuple[list[str], str | None]:
         """
@@ -247,33 +299,36 @@ Return as JSON: {"reasons": ["reason 1", "reason 2"]}"""
         body_text = (extract_email_body(email.body_text) or "")[:3000]
         subject = email.subject or ""
 
-        resp = _create_chat_completion(
+        user_content = f"From: {email.sender}\nSubject: {subject}\n\n{body_text}"
+
+        result = _create_openai_text(
             client=self._client,
             model=settings.openai_model,
             max_tokens=256,
-            messages=[
-                {"role": "system", "content": failure_prompt},
-                {
-                    "role": "user",
-                    "content": f"From: {email.sender}\nSubject: {subject}\n\n{body_text}",
-                },
-            ],
+            system_prompt=failure_prompt,
+            user_content=user_content,
         )
 
-        response_text = resp.choices[0].message.content if resp.choices else ""
-        _log_openai_response("failure_reasons", resp, response_text)
+        response_text = result.text
+        _log_openai_response(
+            kind="failure_reasons",
+            response_id=result.response_id,
+            model=result.model,
+            finish_reason=result.finish_reason,
+            response_text=response_text,
+        )
         try:
             payload = json.loads(response_text)
             reasons = payload.get("reasons") if isinstance(payload, dict) else payload
             if isinstance(reasons, list):
-                return [str(r) for r in reasons], resp.id
+                return [str(r) for r in reasons], result.response_id
         except json.JSONDecodeError:
             logger.warning(
                 "Failed to parse OpenAI reasons as JSON: id=%s len=%d",
-                resp.id,
+                result.response_id,
                 len(response_text or ""),
             )
-        return ["We need more details to process your request"], resp.id
+        return ["We need more details to process your request"], result.response_id
 
     async def parse(
         self, email: EmailMessage
@@ -308,24 +363,79 @@ Return as JSON: {"reasons": ["reason 1", "reason 2"]}"""
         return extracted, response_id, None
 
 
-def _create_chat_completion(
+def _iter_responses_api_output_text(resp):
+    output = getattr(resp, "output", None)
+    if not isinstance(output, list):
+        return
+    for item in output:
+        content = getattr(item, "content", None)
+        if not isinstance(content, list):
+            continue
+        for c in content:
+            if getattr(c, "type", None) != "output_text":
+                continue
+            text = getattr(c, "text", None)
+            if isinstance(text, str) and text:
+                yield text
+
+
+def _extract_text_from_responses_api(resp) -> str:
+    """
+    Extraction robuste du texte depuis une réponse `client.responses.create`.
+
+    On essaie d'abord `output_text` (helper du SDK), puis on fallback sur la
+    structure `output` si nécessaire.
+    """
+    output_text = getattr(resp, "output_text", None)
+    if isinstance(output_text, str) and output_text:
+        return output_text
+    return "".join(_iter_responses_api_output_text(resp) or [])
+
+
+def _create_openai_text_via_responses_api(
     *,
     client: OpenAI,
     model: str,
-    messages: list[dict],
     max_tokens: int,
-):
-    """
-    Wrapper d'appel OpenAI qui:
-    - sélectionne `max_tokens` ou `max_completion_tokens` selon le modèle
-    - force `temperature=0` (extraction déterministe)
-    - active `response_format={"type": "json_object"}` quand supporté
-    """
+    system_prompt: str,
+    user_content: str,
+) -> _OpenAITextResult:
     kwargs: dict = {
         "model": model,
-        "messages": messages,
-        "temperature": 0,
+        "instructions": system_prompt,
+        "input": user_content,
+        "max_output_tokens": max_tokens,
     }
+    # Ne pas forcer `temperature` ici: certains modèles n'acceptent pas de
+    # valeur autre que la défaut.
+    resp = client.responses.create(**kwargs)
+    text = _extract_text_from_responses_api(resp)
+    return _OpenAITextResult(
+        response_id=getattr(resp, "id", None),
+        model=getattr(resp, "model", None),
+        finish_reason=getattr(resp, "status", None),
+        text=text or "",
+    )
+
+
+def _create_openai_text_via_chat_completions(
+    *,
+    client: OpenAI,
+    model: str,
+    max_tokens: int,
+    system_prompt: str,
+    user_content: str,
+) -> _OpenAITextResult:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    kwargs = {
+        "model": model,
+        "messages": messages,
+    }
+    if _supports_temperature_control(model):
+        kwargs["temperature"] = 0
     if _uses_max_completion_tokens(model):
         kwargs["max_completion_tokens"] = max_tokens
     else:
@@ -333,21 +443,72 @@ def _create_chat_completion(
     if _supports_json_response_format(model):
         kwargs["response_format"] = {"type": "json_object"}
 
-    return client.chat.completions.create(**kwargs)
+    resp = client.chat.completions.create(**kwargs)
+    choice0 = resp.choices[0] if getattr(resp, "choices", None) else None
+    msg0 = getattr(choice0, "message", None)
+    text = getattr(msg0, "content", None)
+    return _OpenAITextResult(
+        response_id=getattr(resp, "id", None),
+        model=getattr(resp, "model", None),
+        finish_reason=getattr(choice0, "finish_reason", None),
+        text=text or "",
+    )
 
 
-def _log_openai_response(kind: str, resp, response_text: str | None) -> None:
+def _create_openai_text(
+    *,
+    client: OpenAI,
+    model: str,
+    max_tokens: int,
+    system_prompt: str,
+    user_content: str,
+):
+    """
+    Wrapper d'appel OpenAI renvoyant un texte (JSON attendu).
+
+    Stratégie
+    ---------
+    - Modèles récents (`gpt-5*`, `o1*`, ...) : `client.responses.create`
+      avec `max_output_tokens` (et omission de `temperature` si non supporté).
+    - Modèles classiques : `client.chat.completions.create`
+      avec `max_tokens`/`max_completion_tokens` et `temperature=0` quand supporté.
+    """
+    if _uses_responses_api(model):
+        return _create_openai_text_via_responses_api(
+            client=client,
+            model=model,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            user_content=user_content,
+        )
+
+    return _create_openai_text_via_chat_completions(
+        client=client,
+        model=model,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+        user_content=user_content,
+    )
+
+
+def _log_openai_response(
+    *,
+    kind: str,
+    response_id: str | None,
+    model: str | None,
+    finish_reason: str | None,
+    response_text: str | None,
+) -> None:
     """
     Log la réponse OpenAI sans contenu en prod (PII potentielles).
     Le contenu intégral n'est loggé que si `LOG_OPENAI_PAYLOAD=true`.
     """
-    finish = resp.choices[0].finish_reason if resp.choices else None
     base = (
         "OpenAI %s response: id=%s model=%s finish_reason=%s len=%d",
         kind,
-        getattr(resp, "id", None),
-        getattr(resp, "model", None),
-        finish,
+        response_id,
+        model,
+        finish_reason,
         len(response_text or ""),
     )
     logger.info(*base)
@@ -356,6 +517,6 @@ def _log_openai_response(kind: str, resp, response_text: str | None) -> None:
         logger.debug(
             "OpenAI %s full payload: id=%s content=%s",
             kind,
-            getattr(resp, "id", None),
+            response_id,
             response_text,
         )

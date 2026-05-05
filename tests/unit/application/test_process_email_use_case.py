@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from application.use_cases.process_email_use_case import ProcessEmailUseCase
@@ -15,6 +17,7 @@ class _FakeParseUC:
         self.calls = 0
 
     async def execute(self, _email):
+        await asyncio.sleep(0)
         self.calls += 1
         if self.raise_exc is not None:
             raise self.raise_exc
@@ -26,6 +29,7 @@ class _FakePublisher:
         self.published: list[dict] = []
 
     async def publish_fare_event(self, fare_event):
+        await asyncio.sleep(0)
         self.published.append(fare_event)
 
 
@@ -35,9 +39,11 @@ class _FakeNotifyUC:
         self.support_calls: list[dict] = []
 
     async def user_untreatable(self, **kwargs):
+        await asyncio.sleep(0)
         self.user_calls.append(kwargs)
 
     async def support_alert(self, **kwargs):
+        await asyncio.sleep(0)
         self.support_calls.append(kwargs)
 
 
@@ -65,6 +71,35 @@ async def test_process_email_publishes_fare_event():
     assert publisher.published == [fare]
     assert notify.user_calls == []
     assert notify.support_calls == []
+
+
+@pytest.mark.asyncio
+async def test_process_email_parsing_failed_emits_user_untreatable_and_no_publish():
+    fare = {
+        "id": "fe-1",
+        "sender": "a@b.com",
+        "parsed_at": "2024-01-01T00:00:00Z",
+        "email_body_length": 10,
+        "status": "parsing_failed",
+        "failure_reasons": ["Missing origin"],
+    }
+    publisher = _FakePublisher()
+    notify = _FakeNotifyUC()
+    uc = ProcessEmailUseCase(
+        parse_email=_FakeParseUC(fare_event=fare),
+        publisher=publisher,
+        notify_failure=notify,
+    )
+    email = EmailMessage(sender="a@b.com", subject="s", body_text="hi")
+
+    result = await uc.execute(email)
+
+    assert result == fare
+    assert publisher.published == []
+    assert len(notify.user_calls) == 1
+    call = notify.user_calls[0]
+    assert call["email"] is email
+    assert call["code"] == FailureCode.PARSE_FAILED
 
 
 @pytest.mark.asyncio

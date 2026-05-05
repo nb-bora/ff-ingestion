@@ -294,9 +294,9 @@ Déclencheur:
 
 Étapes:
 1) Nettoie le body via `extract_email_body` (enlève headers/bruit multipart)
-2) Appel OpenAI Chat Completions avec:
-   - `temperature=0`
-   - `response_format={"type":"json_object"}` (modèles compatibles)
+2) Appel OpenAI avec:
+  - **`temperature=0` quand le modèle le supporte** (sinon on omet le paramètre)
+  - `response_format={"type":"json_object"}` quand supporté (ou équivalent via l’API Responses)
 3) Parse la réponse:
    - si JSON invalide → extraction `{}` + demande de “failure reasons”
 4) Validation minimale:

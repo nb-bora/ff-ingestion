@@ -50,6 +50,10 @@ from logger import logger
 from presentation.schemas.fare_event_schema import FareEventSchema
 from shared.exceptions import MissingSenderError, ParseError
 
+_DEFAULT_PARSE_FAILED_SUMMARY = (
+    "Nous n'avons pas réussi à interpréter votre demande automatiquement."
+)
+
 
 class ProcessEmailUseCase:
     """Use-case "consumer": parse + validation post-parse + publish."""
@@ -67,15 +71,17 @@ class ProcessEmailUseCase:
 
     async def execute(self, email: EmailMessage) -> dict:
         """
-        Parse l'email, valide le `FareEvent` (non bloquant), publie, retourne.
+        Parse l'email, route selon Tier 1, publie/notify, retourne.
 
         Étapes
         ------
         - Valide le sender (sinon `MissingSenderError` propagée)
         - Parse → `FareEvent` dict
             - en cas de `ParseError` : émet une `user_untreatable` puis re-raise
-        - Valide via `FareEventSchema` (log uniquement, pas bloquant)
-        - Publie sur la queue downstream
+        - Si `status != parsed` : notifie (queue notifications) et NE publie PAS
+          sur la queue fare-event
+        - Sinon: valide via `FareEventSchema` (log uniquement, pas bloquant)
+          puis publie sur la queue downstream
         - Retourne le `FareEvent`
         """
         if not email.sender:
@@ -94,6 +100,17 @@ class ProcessEmailUseCase:
             )
             raise
 
+        # Workflow contractuel: seuls les events "parsed" partent sur la queue
+        # downstream; le reste part en notifications user_untreatable.
+        if (fare_event or {}).get("status") != "parsed":
+            await self._notify_failure.user_untreatable(
+                email=email,
+                code=FailureCode.PARSE_FAILED,
+                fare_event=fare_event,
+                human_summary=_human_summary_from_fare_event(fare_event),
+            )
+            return fare_event
+
         _validate_non_blocking(fare_event)
         await self._publisher.publish_fare_event(fare_event)
         return fare_event
@@ -111,3 +128,16 @@ def _validate_non_blocking(fare_event: dict) -> None:
             e.errors(),
             json.dumps(fare_event, ensure_ascii=False)[:500],
         )
+
+
+def _human_summary_from_fare_event(fare_event: dict | None) -> str:
+    """Construit un résumé user-friendly depuis `failure_reasons` si présent."""
+    if not isinstance(fare_event, dict):
+        return _DEFAULT_PARSE_FAILED_SUMMARY
+    reasons = fare_event.get("failure_reasons")
+    if isinstance(reasons, list) and reasons:
+        # Garder court et robuste; le notifier affichera aussi les missing_fields.
+        return " ".join(str(r) for r in reasons if r)[:300] or (
+            _DEFAULT_PARSE_FAILED_SUMMARY
+        )
+    return _DEFAULT_PARSE_FAILED_SUMMARY
